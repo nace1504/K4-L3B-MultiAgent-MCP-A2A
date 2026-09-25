@@ -16,13 +16,6 @@ class Settings:
     team_api_key: str
     mcp_endpoint: str
     root: Path
-    openai_api_key: str = ""
-    openai_model: str = "gpt-4o-mini"
-
-    def require_openai(self) -> None:
-        """Fail fast before any LLM call when the OpenAI key is missing."""
-        if not self.openai_api_key:
-            raise ValueError("OPENAI_API_KEY must be set in .env to run the LLM agents")
 
     @classmethod
     def load(cls, root: Path | None = None) -> Settings:
@@ -40,6 +33,4 @@ class Settings:
             errors.append("MCP_ENDPOINT must be an absolute HTTP(S) URL")
         if errors:
             raise ValueError("; ".join(errors))
-        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-        openai_model = os.getenv("OPENAI_MODEL", "").strip() or "gpt-4o-mini"
-        return cls(api_url, team_key, mcp_endpoint, resolved_root, openai_key, openai_model)
+        return cls(api_url, team_key, mcp_endpoint, resolved_root)

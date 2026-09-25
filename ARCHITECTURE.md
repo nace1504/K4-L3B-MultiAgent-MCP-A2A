@@ -1,177 +1,136 @@
 # L3B Architecture Record
 
-Tài liệu mô tả quyết định đã hiện thực trong `src/student_agent/` (`workflow.py`, `llm.py`,
-`evidence.py`). Không ghi system prompt hay chain-of-thought.
+Tài liệu mô tả quyết định có thể kiểm chứng của workflow. Không ghi prompt bí mật hoặc
+chain-of-thought vào output hay trace.
 
 ## 1. System overview
 
 ```text
-case input
-   │
-   ▼
-Coordinator (code) ──task_assigned──▶ Entity Resolver (LLM: get_order, get_customer_history)
-   │◀──────────────── handoff ─────────┘
-   │  host: build_versions()  → chọn phiên bản đơn hàng theo opened_at (rule, không LLM)
-   │
-   ├─task_assigned─▶ Payment/Refund Agent (LLM) ─┐
-   ├─task_assigned─▶ Policy Agent (LLM)          ├─ chạy song song, handoff về Coordinator
-   └─task_assigned─▶ Shipment Agent (LLM)*       ┘   (*chỉ khi claim liên quan giao hàng/fulfilment)
-   │  host: evidence floor + host_facts + detected_conflicts
-   ▼
-Conflict Resolver (LLM, không tool) ──handoff──▶ Verifier (code) ──(≤1 vòng sửa)──▶ output
-                                                     │
-MCP Gateway ◀── mọi tool call do HOST thực thi ──────┴── trace.jsonl (sự kiện quan sát được)
+Input ─► Entity agent (rule) ─► Coordinator evidence plan (MCP, song song, mỗi tool 1 lần)
+                                   │
+                                   ▼
+                       scoped_evidence(): incident window, loại decoy
+                                   │
+          ┌────────────────────────┼────────────────────────┐
+          ▼                        ▼                        ▼
+   order-agent (LLM)      shipment-agent (LLM)      payment-agent (LLM)     ← chạy song song
+          └───────── grounding: bỏ finding mâu thuẫn facts ─┘
+                                   ▼
+          Coordinator (LLM) chọn primary_issue trong allowed_issues
+                                   ▼
+            Verifier (rule engine độc lập) ── bất đồng ─► Coordinator xem lại 1 lần
+                                   │            vẫn bất đồng ─► lấy issue của verifier, confidence 0.55
+                                   ▼
+          analyze_case(issue_override): policy, refund, entities ─► hard checks ─► Output
+MCP evidence ──► case-local ledger ──► tool_result_consumed ──► Trace
 ```
 
-LLM chỉ chọn tool và suy luận trên evidence thật; **host code** thực thi MCP call, giữ
-`evidence_ref`, tính số liệu và áp đặt các giá trị tất định từ policy.
+LLM đề xuất issue và phải được verifier xác nhận. Khi LLM vẫn bất đồng sau lần xem lại,
+case fail-closed về issue của verifier: trong lần chạy đầu tiên với 100 case, 17/17 lần LLM
+đè kết quả của rule đều là false positive (LLM báo trễ hàng hoặc mismatch không có thật) và
+đề xuất refund sai. Nếu LLM không trả lời được (lỗi API), case là `insufficient_evidence`.
+Phần tính toán tài chính, policy mapping và entity được suy ra cơ học từ issue bằng code, để
+tránh LLM bịa số tiền hoặc evidence ref.
 
 ## 2. Agent ownership
 
 | Actor | Input | Trách nhiệm | Tool permission | Output/handoff |
 | --- | --- | --- | --- | --- |
-| Entity/customer (`entity-resolver`, LLM) | candidate ids, claimed id, customer hint | Resolve candidate có `get_order` thật và thuộc history khách; reject phần còn lại | `get_order`, `get_customer_history` | status, resolved/rejected (host kiểm lại) → Coordinator |
-| Coordinator (code) | case + kết quả entity | Tạo A2A envelope, định tuyến claim topic → specialist, gom kết quả | không | `task_assigned` / nhận `handoff` |
-| Order/product | — | Gộp vào Payment (items để tính tổng đơn) và Policy (product context) | — | — |
-| Shipment (`shipment-agent`, LLM) | order id, version context | Verdict giao hàng, late seller, timeline_complete | `get_shipment_summary`, `get_sellers` | verdict + citations → Coordinator |
-| Payment/refund (`payment-agent`, LLM) | order id, version context | Verdict thanh toán/hoàn tiền, totals khớp `host_facts` | `get_payment_timeline`, `get_refund_timeline`, `get_order_items`, `get_order_payments` (chỉ khi timeline lỗi) | verdict + totals + citations → Coordinator |
-| Policy (`policy-agent`, LLM) | policy_version, order id | Lấy policy đúng version + product context; không kết luận case | `get_policy`, `get_product_context` | policy context → Coordinator |
-| Conflict resolver (LLM) | briefing: findings, host_facts, policy rules, detected_conflicts, evidence index | primary_issue, claim_assessments, data_conflicts, parties, actions, confidence | **không** | draft assessment → Verifier |
-| Verifier (code) | draft + evidence store | Kiểm invariant (mục 6), yêu cầu sửa tối đa 1 vòng | không | `verification_completed` |
+| Entity/customer | case, customer hint, claimed order | Xác nhận claimed order có trong history của khách; reject `candidate-*` | `get_customer_history`, `get_order` | `ENTITY_RESOLVED` / `ENTITY_NOT_FOUND` |
+| Coordinator | brief, findings, scoped evidence | Lập evidence plan; LLM chọn một `primary_issue` | Không gọi tool trực tiếp | `policy_decided` |
+| Order/product | facts, incident order, items, payments | LLM, chỉ được trả `canceled_order_paid`, `unavailable_order_paid` hoặc `null` | `get_order_items` | finding `{issue, confidence}` |
+| Shipment | facts, incident order, items, shipment events, shipping limits | LLM, chỉ được trả `late_delivery_seller`, `late_delivery_logistics` hoặc `null` | `get_shipment_summary` | finding |
+| Payment/refund | facts, payments, payment/refund events | LLM, chỉ được trả duplicate, mismatch, split, refund pending/failed hoặc `null` | `get_payment_timeline`, `get_refund_timeline` | finding |
+| Policy | policy version | Nạp rules theo issue | `get_policy` | `POLICY_LOADED` |
+| Conflict resolver | history vs order vs shipment | Chọn incident window trước `opened_at`, ghi `data_conflicts` | Không gọi tool | trong `scoped_evidence` / `analyze_case` |
+| Verifier | output ứng viên | Rule engine phản biện issue; hard checks schema/refs/tiền | Không gọi tool | `verification_completed` |
 
-Least privilege được **ép ở host**: mỗi agent có allow-list riêng (`TOOL_PERMISSIONS`); tool
-ngoài danh sách không được thực thi (`tool_not_permitted`). Thêm guard phạm vi: specialist chỉ
-được hỏi đúng order đã resolve; `policy_version` phải trùng case; `customer_unique_id` phải
-là hint của case; order id sai định dạng (vd `candidate-NNN`) bị từ chối **không gọi MCP**.
+Mỗi specialist chỉ được báo issue thuộc domain của mình; issue ngoài domain bị bỏ thành
+`null`. `facts` là các giá trị tính chính xác (ngày giao so với ngày dự kiến, lúc giao cho
+carrier so với shipping limit, tổng capture, dòng payment trùng, trạng thái refund mới nhất),
+lấy từ cùng các biến mà rule engine dùng, để LLM không phải tự so sánh ngày tháng hay số tiền.
+
+Hai lớp chặn false positive trước verifier:
+- **Grounding:** finding `late_delivery_seller`, `late_delivery_logistics` hoặc
+  `payment_mismatch` mâu thuẫn với `facts` bị bỏ thành `null` (ghi `rejected_issue` trong
+  handoff). Trên 100 dump, bộ lọc không loại nhầm case nào (28/28 case thật qua được).
+- **allowed_issues:** coordinator chỉ được chọn issue mà ít nhất một specialist đã báo, hoặc
+  `unsupported_claim` / `insufficient_evidence`; khi xem lại thì thêm issue của verifier.
+  Chọn ngoài danh sách thì bị bỏ (`policy_decided.attributes.rejected_issue`).
+
+Replay offline 100 case với cả hai lớp: 100/100 `PASS`, 0 lần LLM bất đồng với verifier
+(trước đó có 11 case `PASS_RULES_OVER_LLM`).
+
+Argument của mọi tool do code cố định: `case_id`, customer hint, `policy_version` và
+order đã resolve. LLM không bao giờ nhìn thấy hoặc cung cấp `case_id` hay `evidence_ref`.
 
 ## 3. Entity resolution và A2A protocol
 
-- Candidate = `claimed_order_id` ∪ `candidate_order_ids` (loại trùng). ID không đúng định dạng
-  32-hex bị reject ngay, không tốn MCP call.
-- LLM đề xuất resolved/rejected; host chỉ chấp nhận order có evidence `get_order` thành công
-  trong case **và** có trong customer history (nếu history có dữ liệu). Mọi candidate còn lại
-  vào `rejected_candidates`. `status`: 1 order → `resolved`, >1 → `ambiguous`, 0 → `not_found`.
-  Nếu status LLM khác status host tính, confidence entity bị hạ ≤ 0.6.
-- Không resolved → trả output `insufficient_evidence` / `needs_investigation`, không gọi specialist.
-- **Envelope A2A** (`A2AMessage`): `{sender, recipient, case_id, correlation_id, task, payload}`.
-  Coordinator tạo `correlation_id` cho mỗi task; reply dùng lại correlation_id. Trace chỉ ghi
-  `actor`, `target`, `decision_code` (tên task/verdict), `evidence_refs` thật và
-  `attributes.correlation_id` — **không** ghi payload/prompt/reasoning.
-- Chống vòng lặp: mỗi agent tối đa 4 vòng tool (`MAX_ITERATIONS`), vòng cuối ép
-  `tool_choice="none"` để phải trả lời; verifier chỉ cho 1 vòng sửa.
+- Claimed order chỉ được chấp nhận khi có trong `get_customer_history`, còn ID dạng
+  `candidate-*` bị loại. Không resolve được thì không gọi các tool theo order, và output sẽ là
+  `insufficient_evidence`.
+- Order có nhiều snapshot thì chọn dòng có purchase timestamp muộn nhất nhưng không sau
+  `opened_at`, bỏ qua snapshot trùng với `get_order` (decoy). Cửa sổ incident kéo dài tới lần
+  mua kế tiếp.
+- Mọi message được correlation bằng `case_id`, handoff là `task_assigned` → `handoff`.
+  Không có vòng lặp agent tự do: specialist gọi LLM 1 lần, coordinator tối đa 2 lần (thêm 1
+  lần xem lại khi verifier phản đối).
 
 ## 4. Evidence và conflict lifecycle
 
-**Evidence grounding (evidence_store + local_id):**
-1. LLM trả `tool_call` với tham số (không có `case_id`).
-2. Host gọi `gateway.call(tool, case_id=<case hiện tại>, ...)`; gateway validate response theo
-   `mcp-evidence-response-v1`.
-3. `EvidenceStore` (1 instance/case, tạo mới mỗi case) lưu `{E1, E2, ...} → evidence_ref,
-   domain, data`, cache theo `(tool, args)` nên cùng evidence không bị gọi lại, kể cả khi
-   agent khác cần. Lần đầu mỗi actor dùng evidence → emit `tool_result_consumed` với
-   `evidence_ref` thật.
-4. LLM chỉ nhận `local_id` + view dữ liệu; mọi trích dẫn là `E#`. Host map `E#` →
-   `evidence_ref` khi ráp output; `E#` không tồn tại bị loại và bị verifier báo lỗi.
-   LLM không bao giờ thấy hay viết chuỗi `ev_...`.
-
-**Phiên bản đơn hàng (quyết định nghiệp vụ quan trọng nhất):** dữ liệu MCP của một order có
-thể chứa **hai phiên bản** chồng nhau (2 dòng history cùng order_id, item/payment trùng key,
-capture ở hai mốc thời gian). Dòng `get_order` không phải lúc nào cũng là phiên bản của khiếu
-nại. Host chọn phiên bản bằng rule trước khi đưa dữ liệu cho LLM:
-- khiếu nại chỉ có thể nói về phiên bản đã tồn tại khi mở case → ưu tiên phiên bản có
-  purchase **và** ngày giao dự kiến ≤ `opened_at` (đã đến hạn), kế đến phiên bản chỉ có
-  purchase ≤ `opened_at`; chọn purchase mới nhất; không có `opened_at` hợp lệ → dùng dòng
-  `get_order` (authoritative);
-- mỗi bản ghi có ngày (item shipping limit, capture, refund, shipment event) thuộc phiên
-  bản có purchase muộn nhất nhưng ≤ ngày bản ghi; payment row không có ngày được nối theo số
-  tiền capture;
-- LLM nhận `data` = phần của phiên bản đã chọn và `excluded_other_version_rows` riêng;
-- hai phiên bản **trùng mốc thời gian** (không tách được) và evidence ủng hộ >1 cách hiểu →
-  basis `inseparable_versions`: Conflict Resolver nhận danh sách
-  `evidence_supported_interpretations`, claim topic chỉ được chọn nếu nằm trong danh sách đó,
-  conflict ghi `selected_source: null`, confidence thấp.
-
-**data_conflicts:** host phát hiện tất định (`detected_conflicts`): `order.version`
-(get_order vs get_customer_history) và mỗi tool có dòng thuộc phiên bản khác
-(`order_items`, `payment`, `refund`, `shipment.events`). Conflict Resolver quyết định
-`selected_source` trong các nguồn đó; host giữ `field/sources` chuẩn, `resolution_code` là
-căn cứ của host (vd `unique_due_version`, `rows_linked_to_selected_order_version`). Conflict
-khác do LLM thêm chỉ được nhận khi sources là tên tool hợp lệ. Tối đa 5.
-
-**Claim ↔ evidence:** claim topic là giả thuyết cần kiểm, không phải sự thật. Topic claim
-`supported` khi trùng primary_issue; `requested_full_refund` là `supported` khi hoàn = tổng
-đã capture, `partially_supported` khi 0 < hoàn < capture, `unsupported` khi hoàn = 0.
+`EvidenceGateway` validate mọi MCP envelope theo contract. `_Case` là ledger trong phạm vi
+case: mỗi tool gọi tối đa 1 lần (cache cả kết quả lỗi). Gateway chỉ retry 1 lần khi tool
+lỗi hoặc timeout, vì server từng lỗi chập chờn ở các call đầu của một lần chạy. Mỗi response
+dùng được sẽ emit `tool_result_consumed` với `evidence_ref` nguyên bản do actor sở hữu tool
+ghi. Output chỉ chứa refs có trong ledger (verifier kiểm tra `REFS`). Không chia sẻ evidence
+giữa các case.
 
 ## 5. Failure and efficiency policy
 
 | Failure | Retry budget | Fallback | Trace event/code |
 | --- | ---: | --- | --- |
-| MCP timeout / lỗi mạng | 1 retry, backoff 1s | coi như không có evidence, không phỏng đoán dữ liệu | không có `tool_result_consumed` |
-| Mất kết nối MCP session (stream bị ngắt) | 3 lần/case, backoff 2s·n | CLI kết nối lại, xóa trace dở dang của case đó rồi chạy lại riêng case đó; case đã xong giữ nguyên | log `WARN` ra stderr (không vào trace) |
-| MCP tool error (vd order không tồn tại, không có refund) | 0 (tất định) | cache kết quả rỗng trong case; LLM nhận `{"error": "no_result"}` | — |
-| Entity not found/ambiguous | 0 | output `insufficient_evidence`, `needs_investigation` | `handoff entity_not_found/ambiguous`, `verification_completed passed_insufficient_evidence` |
-| Source conflict | 0 | rule phiên bản + `data_conflicts`; không tách được → `selected_source: null` | `handoff inseparable_versions...` qua decision_code của resolver |
-| Agent vượt vòng lặp / không trả JSON hợp lệ | 4 vòng tool/agent; OpenAI SDK retry 3 lần | answer = null → section dùng `insufficient_evidence` / host facts | `handoff <task>:no_answer` |
-| Invalid specialist/resolver result | 1 vòng sửa | host áp giá trị tất định từ policy, confidence ≤ 0.5 | `verification_completed enforced_by_host[_after_repair]` |
+| MCP timeout/tool error | 1 (chờ 1.5s, tool chỉ đọc nên idempotent) | Ghi `None` trong ledger; specialist thấy trong `missing_tools` | `handoff/TOOL_CALL_FAILED` |
+| Entity not found/ambiguous | 0 | Không gọi tool theo order; `insufficient_evidence` | `ENTITY_NOT_FOUND` |
+| Source conflict | 0 | Chọn incident window theo `opened_at`; ghi `data_conflicts` | `verification_completed` |
+| Invalid specialist result | 0 | Finding `None`; coordinator vẫn chạy | `handoff/NO_FINDING` |
+| Finding mâu thuẫn facts | 0 | Bỏ thành `null` | `handoff.attributes.rejected_issue` |
+| Coordinator chọn issue ngoài allowed | 0 | Bỏ; verifier yêu cầu xem lại | `policy_decided.attributes.rejected_issue` |
+| LLM 429/5xx | 2 (backoff 1s, 2s) | Hết lượt: issue `insufficient_evidence` | `ISSUE_MISMATCH` |
+| Lỗi bất ngờ trong case | 0 | Output rule-based rỗng evidence cho case đó | stderr `WARN` |
 
-**Efficiency:** cache `(tool,args)` trong case; ID sai định dạng không gọi MCP; `get_sellers`
-chỉ khi seller có thể chịu trách nhiệm; `get_order_payments` chỉ khi timeline lỗi; Shipment
-Agent chỉ được định tuyến cho topic giao hàng/fulfilment (payment + policy luôn chạy vì mọi
-case có `requested_full_refund`). **Evidence floor**: nếu agent bỏ sót `get_payment_timeline`,
-`get_order_items` hoặc `get_policy`, host tự gọi đúng 1 lần dưới quyền agent sở hữu tool đó.
-Thực đo trên mẫu: 7–9 MCP call/case (gồm 1 call `get_refund_timeline` lỗi khi không có refund).
+Budget MCP: 6 call/case (`history`, `order`, `items`, `shipment`, `payment_timeline`,
+`policy`), thêm `refund_timeline` khi claim hoặc payment event có refund, và
+`get_product_context` chỉ khi issue cuối là `unsupported_claim` (evidence bắt buộc). Hard cap
+8 call. Không gọi `get_order_payments`, `get_sellers`. Đo offline trên 100 dump: bỏ bất kỳ
+tool nào trong 6 tool cơ bản đều làm đổi một trường output (`affected_entities`,
+`shipment_analysis`, `payment_analysis`, `data_conflicts`), nên đây là mức tối thiểu.
+Mọi MCP call đều bị audit, nên chỉ chạy thật 1 lần cho mỗi bản nộp; tinh chỉnh prompt bằng
+`scripts/replay_llm.py`.
+Budget LLM: 4 call/case (5 khi verifier phản đối).
 
 ## 6. Verification invariants
 
-Verifier (code) kiểm trước finalize; nếu có lỗi gửi danh sách lỗi cho Conflict Resolver sửa
-tối đa 1 vòng:
-
-- `primary_issue` thuộc enum **và** được evidence của phiên bản đã chọn ủng hộ (predicate
-  tất định cho từng issue: trạng thái canceled/unavailable + đã capture, refund failed/pending,
-  reconciliation mismatch mở, capture lặp không khớp tổng đơn, giao trễ + handoff trễ/đúng hạn,
-  nhóm capture khớp đúng tổng đơn);
-- `case_status`, `recommended_action`, số tiền hoàn theo rule policy của primary_issue; hoàn
-  ≤ tổng capture; `no_action` → hoàn 0;
-- seller party/late seller thuộc seller của order; không dùng seller id ví dụ trong policy;
-- mọi local id được trích dẫn tồn tại trong evidence_store của case;
-- claim_assessments phủ đúng tập claim của input;
-- mọi conflict host phát hiện có trong `data_conflicts`;
-- khi ráp output: schema l3b-output-v2 (CLI validate lại), `case_id` khớp, entity scope
-  (affected ⊆ resolved, resolved ∩ rejected = ∅), totals lấy từ host facts, confidence ∈ [0,1].
-
-Lỗi còn lại sau vòng sửa → host áp giá trị tất định (policy/host facts) và trace ghi
-`enforced_by_host`.
-
-**Confidence:** trần theo căn cứ chọn phiên bản (`single_version` 0.95, `unique_due_version`
-0.93, `latest_due_version` 0.90, `latest_placed_version` 0.80, `authoritative_fallback`
-0.70, `inseparable_versions` 0.65). Confidence của LLM chỉ được hạ trong một biên độ (trần −
-0.08) khi verifier pass ngay; phải sửa → trần − 0.1 tối đa; còn lỗi → ≤ 0.5.
+Output validate đúng JSON Schema. Refs nằm trong tập đã consume. `evidence_refs` ở
+top-level giữ đủ nhóm bắt buộc (history, order, items, shipment, payment, policy, cộng refund
+hoặc product khi cần); `evidence_refs` của từng claim chỉ cite các domain quyết định claim
+đó (`_CLAIM_EVIDENCE`), để tăng độ chính xác evidence. `no_action` không có refund.
+Tổng refund lines bằng `recommended_refund_brl`. Action không trùng. Resolved và rejected
+candidates không giao nhau. Confidence được hiệu chỉnh: LLM đồng ý với verifier thì
+0.95–0.99 (cộng thêm theo số specialist cùng kết luận; calibration chấm
+`(đúng - confidence)^2`); vẫn bất đồng thì lấy issue của
+verifier với confidence 0.55 (`PASS_RULES_OVER_LLM`). CLI validate
+schema lần nữa trước khi ghi file.
 
 ## 7. Reproducibility
 
-- **Model:** `gpt-4o-mini` (biến `OPENAI_MODEL`, mặc định `gpt-4o-mini`), **temperature = 0**
-  cho mọi lời gọi, Structured Outputs (`response_format` JSON Schema `strict: true`) cho mọi
-  agent, function tools `strict: true`. Output LLM vẫn có thể dao động nhẹ giữa các lần chạy;
-  các trường tất định (phiên bản, totals, policy fields) do host tính nên ổn định.
-- **Grounding:** evidence_store + local_id (mục 4) — LLM không tạo `evidence_ref`.
-- **Concurrency:** các case chạy tuần tự (CLI); trong 1 case, Payment/Policy/Shipment chạy
-  song song bằng `asyncio.gather`, MCP call được tuần tự hóa qua lock của EvidenceStore.
-  Timeout OpenAI 90s, SDK retry 3; MCP timeout 300s (starter).
-- **Dependencies:** `pyproject.toml` (`mcp>=2,<3`, `openai>=1,<2`, `jsonschema`, `httpx2`,
-  `python-dotenv`); Python ≥ 3.11. Không dùng random seed (event id của trace là ngẫu nhiên).
-- **Chi phí đo trên mẫu:** ~7–13 lời gọi LLM/case, ~10–15k token input, ~1k token output.
-- **Lệnh chạy:**
-
-  ```bash
-  python -m pip install -e ".[dev]"
-  day09 validate-inputs
-  day09 run
-  day09 validate
-  day09 package --output dist/submission.zip
-  ```
-
-- `.env` cần `COMPETITION_API_URL`, `COMPETITION_TEAM_API_KEY`, `MCP_ENDPOINT`,
-  `OPENAI_API_KEY`, `OPENAI_MODEL`. Không key nào được ghi vào output/trace (package kiểm
-  pattern `sk-team-`).
-- Tương thích: `mcp_gateway.py` được sửa tối thiểu để đọc `is_error` (mcp 2.x) với fallback
-  `isError`.
+- Python ≥ 3.11, dependency pin trong `uv.lock`.
+- LLM: endpoint OpenAI-compatible (`OPENAI_BASE_URL`, `OPENAI_MODEL`), `temperature=0`,
+  `response_format=json_object`. Model phải có **< 10 tỷ tham số**.
+- Concurrency: `DAY09_CONCURRENCY` case song song (mặc định 4); trong một case, các MCP call
+  và 3 specialist chạy song song.
+- Lệnh: `day09 run`, `day09 validate`, `day09 package --output dist/submission.zip`.
+  `DAY09_CASES=L3B_CASE_001,...` chạy một phần; `DAY09_RESUME=1` bỏ qua case đã finalize.
+- Mỗi lần `run` lưu raw evidence vào `debug/` (gitignored, không đóng gói).
+  `python scripts/replay_llm.py [case_id...]` chạy lại toàn bộ workflow LLM trên dump mà
+  không gọi MCP, không ghi `outputs/` hay `traces/`; dùng để tinh chỉnh prompt.
+- API key chỉ đọc từ `.env`.
