@@ -76,6 +76,7 @@ Xem các tool hiện có:
 
 ```bash
 day09 mcp-tools
+day09 mcp-tools --verbose  # kèm description và JSON Schema của tool
 ```
 
 Ví dụ gọi tool trong `workflow.py`:
@@ -139,6 +140,10 @@ Có thể tổ chức các vai trò:
 - verifier.
 
 Competition không chấm tên framework hay số lượng class. Scorer đánh giá output, evidence, efficiency và sự phối hợp thể hiện trong trace.
+
+Workflow hiện tại dùng rule engine xác định và MCP evidence, không gọi LLM (0 tham số).
+Nếu mở rộng bằng model, model phải có ít hơn 10 tỷ tham số; model 10B trở lên không được
+sử dụng.
 
 Trace chỉ ghi sự kiện quan sát được như `task_assigned`, `handoff`, `tool_result_consumed`, `verification_completed`.
 
