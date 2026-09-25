@@ -200,9 +200,9 @@ def test_valid_split_workflow_is_schema_valid_and_traced(tmp_path: Path) -> None
         "get_order_payments",
         "get_payment_timeline",
         "get_policy",
-        "get_product_context",
         "get_shipment_summary",
     }
+    assert "get_product_context" not in gateway.calls
 
     event_types = {
         __import__("json").loads(line)["event_type"]
@@ -282,6 +282,37 @@ def test_temporal_customer_scope_beats_conflicting_direct_order() -> None:
     assert output["financial_resolution"]["recommended_refund_brl"] == 89.0
     assert output["data_conflicts"][0]["field"] == "order_snapshot"
     assert output["data_conflicts"][0]["selected_source"] == "get_customer_history"
+
+
+def test_seller_delay_uses_case_seller_as_responsible_party() -> None:
+    case, responses = valid_split_fixture()
+    case["customer_request"]["claims"][0]["topic"] = "late_delivery_seller"
+    responses["get_shipment_summary"]["data"]["events"] = [
+        {
+            "order_id": "order-1",
+            "event_at": "2018-01-25T09:00:00-03:00",
+            "event_type": "seller_handoff_late",
+            "actor": "seller",
+            "status": "confirmed",
+        }
+    ]
+    responses["get_policy"]["data"]["rules"] = {
+        "late_delivery_seller": {
+            "case_status": "action_required",
+            "recommended_action": "refund_freight",
+            "refund_brl": 10,
+            "responsible_parties": [
+                {"party_type": "seller", "party_id": "seller-policy-placeholder"}
+            ],
+        }
+    }
+
+    output = build_output(case, responses)
+
+    assert output["shipment_analysis"]["late_seller_ids"] == ["seller-1"]
+    assert output["root_cause_analysis"]["responsible_parties"] == [
+        {"party_type": "seller", "party_id": "seller-1"}
+    ]
 
 
 def test_failed_refund_uses_authoritative_refund_lifecycle() -> None:

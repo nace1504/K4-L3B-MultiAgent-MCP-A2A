@@ -27,7 +27,7 @@ xác định từ MCP evidence và policy.
 | --- | --- | --- | --- | --- |
 | Entity/customer | case, candidates, customer hint | Chọn occurrence đúng theo customer scope và `opened_at`; reject candidate sai | `get_customer_history`, `get_order` | resolved order và customer context |
 | Coordinator | case và handoff | Lập kế hoạch tool tối thiểu, phân công, gom kết quả | discovery; không tự tạo evidence | task assignment và final handoff |
-| Order/product | resolved order | Lấy item, seller ID và product context | `get_order_items`, `get_product_context` | affected item/seller entities |
+| Order/item | resolved order | Lấy item và seller ID cần cho entity, payment và trách nhiệm | `get_order_items` | affected item/seller entities |
 | Shipment | resolved order occurrence | Phân tích timeline và actor gây chậm | `get_shipment_summary` | shipment verdict, late seller IDs |
 | Payment/refund | resolved order occurrence | Reconcile capture, duplicate, mismatch và refund lifecycle | `get_order_payments`, `get_payment_timeline`, `get_refund_timeline` | totals và payment verdict |
 | Policy | policy version và issue đã xác minh | Chọn case status, action, refund và responsible party | `get_policy` | policy decision |
@@ -75,8 +75,9 @@ sources, selected source và resolution code; dữ liệu thiếu không đượ
 | Source conflict | 0 | Customer scope + temporal selection; ghi conflict | `CONFLICTS_RESOLVED` |
 | Invalid output invariant | 0 | Fail closed trước khi ghi output | Python `ValueError` |
 
-Baseline mỗi case dùng tám tool: customer, order, items, product, order payments, payment
-timeline, shipment và policy. Refund timeline chỉ được gọi cho `refund_pending` hoặc
+Baseline mỗi case dùng bảy tool: customer, order, items, order payments, payment timeline,
+shipment và policy. Product context không được gọi vì schema output không sử dụng product field.
+Refund timeline chỉ được gọi cho `refund_pending` hoặc
 `refund_failed`, vì gateway biểu diễn trường hợp không có refund bằng tool error. Seller
 details chỉ được gọi cho seller-delay. Giới hạn đồng thời trong một case là bốn call; cache
 ngăn call trùng.

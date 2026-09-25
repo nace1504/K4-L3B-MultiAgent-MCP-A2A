@@ -12,7 +12,6 @@ ACTORS = {
     "get_customer_history": "entity-agent",
     "get_order": "order-agent",
     "get_order_items": "order-agent",
-    "get_product_context": "product-agent",
     "get_sellers": "seller-agent",
     "get_shipment_summary": "shipment-agent",
     "get_order_payments": "payment-agent",
@@ -168,7 +167,6 @@ async def solve_case(
         ledger.fetch("get_order_payments", order_id=resolved_order_id),
         ledger.fetch("get_payment_timeline", order_id=resolved_order_id),
         ledger.fetch("get_policy", policy_version=str(case.get("policy_version") or "")),
-        ledger.fetch("get_product_context", order_id=resolved_order_id),
         ledger.fetch("get_shipment_summary", order_id=resolved_order_id),
     ]
     topic = _primary_claim_topic(case)

@@ -580,14 +580,26 @@ def build_output(
     outstanding_refund = max(Decimal("0"), recommended_refund - refunded_total)
     payment["refundable_total_brl"] = _number(outstanding_refund)
 
+    item_ids = _unique(item.get("order_item_id") for item in items)
+    seller_ids = _unique(item.get("seller_id") for item in items)
+    payment_references = _unique(
+        payment_row.get("payment_sequential") for payment_row in selected_payments
+    )
+    related_order_ids = _unique(row.get("order_id") for row in history)
+
     responsible_parties = _rows(rule.get("responsible_parties"))
-    if not responsible_parties:
-        if primary_issue == "late_delivery_seller" and shipment["late_seller_ids"]:
-            responsible_parties = [
-                {"party_type": "seller", "party_id": shipment["late_seller_ids"][0]}
-            ]
-        else:
-            responsible_parties = [{"party_type": "unknown", "party_id": None}]
+    case_seller_ids: list[str] = []
+    if primary_issue == "late_delivery_seller":
+        case_seller_ids = shipment["late_seller_ids"]
+    elif primary_issue == "unavailable_order_paid":
+        case_seller_ids = seller_ids
+    if case_seller_ids:
+        responsible_parties = [
+            {"party_type": "seller", "party_id": seller_id}
+            for seller_id in case_seller_ids[:5]
+        ]
+    elif not responsible_parties:
+        responsible_parties = [{"party_type": "unknown", "party_id": None}]
     responsible_parties = [
         {
             "party_type": str(party.get("party_type") or "unknown"),
@@ -596,12 +608,6 @@ def build_output(
         for party in responsible_parties[:5]
     ]
 
-    item_ids = _unique(item.get("order_item_id") for item in items)
-    seller_ids = _unique(item.get("seller_id") for item in items)
-    payment_references = _unique(
-        payment_row.get("payment_sequential") for payment_row in selected_payments
-    )
-    related_order_ids = _unique(row.get("order_id") for row in history)
     rejected_candidates = [
         candidate for candidate in candidate_ids if candidate != resolved_order_id
     ]
@@ -747,3 +753,13 @@ def verify_output_invariants(output: Mapping[str, Any]) -> None:
         set(affected.get("seller_ids", []))
     ):
         raise ValueError("late sellers must be present in affected entities")
+
+    if assessment.get("primary_issue") == "late_delivery_seller":
+        responsible = _rows(_mapping(output.get("root_cause_analysis")).get("responsible_parties"))
+        responsible_sellers = {
+            party.get("party_id")
+            for party in responsible
+            if party.get("party_type") == "seller" and party.get("party_id")
+        }
+        if not set(shipment.get("late_seller_ids", [])).issubset(responsible_sellers):
+            raise ValueError("late sellers must be identified as responsible parties")
